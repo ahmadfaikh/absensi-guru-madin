@@ -1,0 +1,10 @@
+{
+  "name": "Absensi Guru Madrasah Diniyah Miftahul Huda",
+  "description": "Aplikasi Absensi Guru Madrasah Diniyah Miftahul Huda – Pondok Pesantren Al Is'af dengan deteksi GPS, rekap absensi, dan sinkronisasi Cloud Google Spreadsheet via Apps Script.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

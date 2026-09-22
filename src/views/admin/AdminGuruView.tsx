@@ -49,6 +49,16 @@ export const AdminGuruView: React.FC = () => {
   const [newPassword, setNewPassword] = useState("");
   const [savingReset, setSavingReset] = useState(false);
 
+  const [isManualUsername, setIsManualUsername] = useState(false);
+
+  const cleanNameToUsername = (val: string) => {
+    return val
+      .replace(/^(ust\b|ust\.|usth\b|usth\.|ustadz\b|ustadzah\b|kyai\b|kh\b|kh\.|habib\b)\s*/i, "")
+      .replace(/,.*$/, "")
+      .replace(/[^a-zA-Z0-9]/g, "")
+      .toLowerCase();
+  };
+
   const fetchGuru = async () => {
     try {
       setLoading(true);
@@ -72,8 +82,16 @@ export const AdminGuruView: React.FC = () => {
     setMataPelajaran("");
     setUsername("");
     setPassword("guru123");
+    setIsManualUsername(false);
     setAddError(null);
     setIsAddModalOpen(true);
+  };
+
+  const handleNamaChange = (val: string) => {
+    setNama(val);
+    if (!isManualUsername) {
+      setUsername(cleanNameToUsername(val));
+    }
   };
 
   const handleSaveAdd = async (e: React.FormEvent) => {
@@ -81,14 +99,16 @@ export const AdminGuruView: React.FC = () => {
     setSavingAdd(true);
     setAddError(null);
 
+    const finalUsername = username.trim() || cleanNameToUsername(nama);
+
     try {
       await api.createGuru({
         nama,
         nip,
         no_hp: noHp,
         mata_pelajaran: mataPelajaran,
-        username,
-        password,
+        username: finalUsername,
+        password: password || "guru123",
       });
       setIsAddModalOpen(false);
       await fetchGuru();
@@ -106,7 +126,7 @@ export const AdminGuruView: React.FC = () => {
     setEditNoHp(guru.no_hp || "");
     setEditMapel(guru.mata_pelajaran || "");
     setEditStatus(guru.status);
-    setEditUsername(guru.username || "");
+    setEditUsername(guru.username || cleanNameToUsername(guru.nama));
     setIsEditModalOpen(true);
   };
 
@@ -252,7 +272,19 @@ export const AdminGuruView: React.FC = () => {
                       {g.no_hp || "-"}
                     </td>
                     <td className="py-3.5 px-3 font-mono font-bold text-sky-800">
-                      {g.username || "-"}
+                      {g.username ? (
+                        <span className="inline-block bg-sky-50 text-sky-800 px-2 py-0.5 rounded-md border border-sky-100">
+                          {g.username}
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenEdit(g)}
+                          className="inline-flex items-center gap-1 text-[11px] text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 px-2 py-0.5 rounded-md font-sans font-semibold transition-colors"
+                        >
+                          + Buat Akun
+                        </button>
+                      )}
                     </td>
                     <td className="py-3.5 px-3">
                       <span
@@ -330,7 +362,7 @@ export const AdminGuruView: React.FC = () => {
                   type="text"
                   required
                   value={nama}
-                  onChange={(e) => setNama(e.target.value)}
+                  onChange={(e) => handleNamaChange(e.target.value)}
                   placeholder="Contoh: Ust. H. Ahmad Fauzi, S.Pd.I"
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-sky-500 focus:outline-hidden"
                 />
@@ -376,22 +408,42 @@ export const AdminGuruView: React.FC = () => {
                 />
               </div>
 
-              <div className="pt-2 border-t border-slate-100">
-                <span className="block font-bold text-sky-800 uppercase text-[11px] mb-2">
-                  Akun Login Absensi Guru
-                </span>
+              <div className="pt-2 border-t border-slate-100 bg-sky-50/50 p-3 rounded-2xl border border-sky-100">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="font-bold text-sky-800 uppercase text-[11px]">
+                    Akun Login Absensi Guru
+                  </span>
+                  <span className="text-[10px] text-sky-600 font-medium">
+                    (Dibuat otomatis dari nama)
+                  </span>
+                </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block font-bold text-slate-700 uppercase mb-1">
-                      Username *
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="font-bold text-slate-700 uppercase">
+                        Username *
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsManualUsername(false);
+                          setUsername(cleanNameToUsername(nama));
+                        }}
+                        className="text-[10px] text-sky-600 hover:underline font-medium"
+                      >
+                        Reset Otomatis
+                      </button>
+                    </div>
                     <input
                       type="text"
                       required
                       value={username}
-                      onChange={(e) => setUsername(e.target.value.toLowerCase().trim())}
+                      onChange={(e) => {
+                        setIsManualUsername(true);
+                        setUsername(e.target.value.toLowerCase().replace(/\s+/g, ""));
+                      }}
                       placeholder="contoh: fauzi"
-                      className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs font-mono focus:ring-2 focus:ring-sky-500 focus:outline-hidden"
+                      className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs font-mono font-bold text-sky-900 bg-white focus:ring-2 focus:ring-sky-500 focus:outline-hidden"
                     />
                   </div>
                   <div>
@@ -404,7 +456,7 @@ export const AdminGuruView: React.FC = () => {
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       placeholder="Minimal 5 karakter"
-                      className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs font-mono focus:ring-2 focus:ring-sky-500 focus:outline-hidden"
+                      className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs font-mono bg-white focus:ring-2 focus:ring-sky-500 focus:outline-hidden"
                     />
                   </div>
                 </div>

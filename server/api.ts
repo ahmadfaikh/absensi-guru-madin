@@ -867,7 +867,60 @@ apiRouter.delete("/admin/absensi/:id", authenticate, requireAdmin, (req: Request
 // Guru Management Endpoints (Admin)
 // ----------------------------------------------------
 
+export function generateUniqueUsername(nama: string, nip?: string, existingGuruId?: number): string {
+  let base = "";
+  if (nip && nip.trim().length >= 4) {
+    base = nip.trim().replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  }
+  
+  if (!base) {
+    const cleanName = nama
+      .replace(/^(ust\b|ust\.|usth\b|usth\.|ustadz\b|ustadzah\b|kyai\b|kh\b|kh\.|habib\b)\s*/i, "")
+      .replace(/,.*$/, "")
+      .replace(/[^a-zA-Z0-9]/g, "")
+      .toLowerCase();
+    base = cleanName || "guru";
+  }
+
+  let candidate = base;
+  let counter = 1;
+  while (true) {
+    const existing = existingGuruId
+      ? queryOne<{ id: number }>("SELECT id FROM users WHERE username = ? AND (guru_id IS NULL OR guru_id != ?)", [candidate, existingGuruId])
+      : queryOne<{ id: number }>("SELECT id FROM users WHERE username = ?", [candidate]);
+    
+    if (!existing) {
+      return candidate;
+    }
+    counter++;
+    candidate = `${base}${counter}`;
+  }
+}
+
 apiRouter.get("/admin/guru", authenticate, requireAdmin, (req: Request, res: Response) => {
+  // Auto-repair any guru missing users account or with empty username
+  const unlinkedGurus = queryAll<{ id: number; nama: string; nip: string }>(
+    `SELECT g.id, g.nama, g.nip 
+     FROM guru g 
+     LEFT JOIN users u ON u.guru_id = g.id 
+     WHERE u.id IS NULL OR u.username IS NULL OR u.username = ''`
+  );
+  if (unlinkedGurus.length > 0) {
+    const defaultPassHash = bcrypt.hashSync("guru123", 10);
+    for (const g of unlinkedGurus) {
+      const uname = generateUniqueUsername(g.nama, g.nip, g.id);
+      const existingUser = queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [g.id]);
+      if (existingUser) {
+        run("UPDATE users SET username = ? WHERE id = ?", [uname, existingUser.id]);
+      } else {
+        run(
+          "INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)",
+          [uname, defaultPassHash, g.id]
+        );
+      }
+    }
+  }
+
   const teachers = queryAll<any>(
     `SELECT g.*, u.username, u.id as user_id
      FROM guru g
@@ -878,44 +931,66 @@ apiRouter.get("/admin/guru", authenticate, requireAdmin, (req: Request, res: Res
 });
 
 apiRouter.post("/admin/guru", authenticate, requireAdmin, (req: Request, res: Response) => {
-  const { nama, nip, no_hp, mata_pelajaran, username, password } = req.body;
+  let { nama, nip, no_hp, mata_pelajaran, username, password } = req.body;
 
-  if (!nama || !username || !password) {
-    res.status(400).json({ error: "Nama lengkap, username, dan password wajib diisi." });
+  if (!nama || !nama.trim()) {
+    res.status(400).json({ error: "Nama lengkap guru wajib diisi." });
     return;
   }
 
-  // Check username unique
-  const userExists = queryOne("SELECT id FROM users WHERE username = ?", [username.trim()]);
-  if (userExists) {
-    res.status(400).json({ error: `Username "${username}" sudah digunakan.` });
-    return;
+  // Auto-generate username if not provided or empty
+  let finalUsername = username ? username.trim().toLowerCase() : "";
+  if (!finalUsername) {
+    finalUsername = generateUniqueUsername(nama, nip);
+  } else {
+    // Check username unique
+    const userExists = queryOne("SELECT id FROM users WHERE username = ?", [finalUsername]);
+    if (userExists) {
+      res.status(400).json({ error: `Username "${finalUsername}" sudah digunakan oleh guru/pengguna lain.` });
+      return;
+    }
   }
 
+  const finalPassword = password && password.trim() ? password.trim() : "guru123";
   const formattedNama = formatTeacherDbName(nama);
 
-  run(
+  const insertResult = run(
     "INSERT INTO guru (nama, nip, no_hp, mata_pelajaran, status) VALUES (?, ?, ?, ?, 'Aktif')",
     [formattedNama, nip ? nip.trim() : "", no_hp ? no_hp.trim() : "", mata_pelajaran ? mata_pelajaran.trim() : ""]
   );
 
-  const lastGuru = queryOne<{ id: number }>("SELECT last_insert_rowid() as id");
-  if (lastGuru) {
-    const hash = bcrypt.hashSync(password, 10);
-    run(
-      "INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)",
-      [username.trim(), hash, lastGuru.id]
-    );
+  let newGuruId = insertResult.lastInsertRowid;
+  if (!newGuruId || newGuruId === 0) {
+    const found = queryOne<{ id: number }>("SELECT id FROM guru WHERE nama = ? ORDER BY id DESC LIMIT 1", [formattedNama]);
+    if (found) newGuruId = found.id;
   }
 
-  res.json({ message: "Data guru dan akun berhasil ditambahkan." });
+  if (newGuruId) {
+    const hash = bcrypt.hashSync(finalPassword, 10);
+    // Check if user already exists for this guru_id
+    const existingUser = queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [newGuruId]);
+    if (existingUser) {
+      run("UPDATE users SET username = ?, password = ? WHERE id = ?", [finalUsername, hash, existingUser.id]);
+    } else {
+      run(
+        "INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)",
+        [finalUsername, hash, newGuruId]
+      );
+    }
+  }
+
+  res.json({ 
+    message: "Data guru dan akun berhasil ditambahkan.",
+    username: finalUsername,
+    guru_id: newGuruId 
+  });
 });
 
 apiRouter.put("/admin/guru/:id", authenticate, requireAdmin, (req: Request, res: Response) => {
   const { id } = req.params;
-  const { nama, nip, no_hp, mata_pelajaran, status, username } = req.body;
+  let { nama, nip, no_hp, mata_pelajaran, status, username } = req.body;
 
-  if (!nama) {
+  if (!nama || !nama.trim()) {
     res.status(400).json({ error: "Nama guru wajib diisi." });
     return;
   }
@@ -927,18 +1002,33 @@ apiRouter.put("/admin/guru/:id", authenticate, requireAdmin, (req: Request, res:
     [formattedNama, nip || "", no_hp || "", mata_pelajaran || "", status || "Aktif", id]
   );
 
-  if (username) {
-    // Check if another user uses this username
-    const exists = queryOne<{ id: number }>(
-      "SELECT id FROM users WHERE username = ? AND guru_id != ?",
-      [username.trim(), id]
-    );
-    if (!exists) {
-      run("UPDATE users SET username = ? WHERE guru_id = ?", [username.trim(), id]);
-    }
+  let finalUsername = username ? username.trim().toLowerCase() : "";
+  if (!finalUsername) {
+    finalUsername = generateUniqueUsername(nama, nip, Number(id));
   }
 
-  res.json({ message: "Data guru berhasil diperbarui." });
+  // Check if another user uses this username
+  const exists = queryOne<{ id: number }>(
+    "SELECT id FROM users WHERE username = ? AND guru_id != ?",
+    [finalUsername, id]
+  );
+  if (exists) {
+    res.status(400).json({ error: `Username "${finalUsername}" sudah digunakan oleh guru/pengguna lain.` });
+    return;
+  }
+
+  const existingUser = queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [id]);
+  if (existingUser) {
+    run("UPDATE users SET username = ? WHERE id = ?", [finalUsername, existingUser.id]);
+  } else {
+    const defaultHash = bcrypt.hashSync("guru123", 10);
+    run(
+      "INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)",
+      [finalUsername, defaultHash, id]
+    );
+  }
+
+  res.json({ message: "Data guru dan akun login berhasil diperbarui.", username: finalUsername });
 });
 
 apiRouter.post("/admin/guru/:id/reset-password", authenticate, requireAdmin, (req: Request, res: Response) => {

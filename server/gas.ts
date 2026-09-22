@@ -220,8 +220,8 @@ function responseJSON(obj) {
 }
 `;
 
-export function getGasConfig(): GasConfig {
-  const settings = queryOne<{
+export async function getGasConfig(): Promise<GasConfig> {
+  const settings = await queryOne<{
     gas_url?: string;
     gas_auto_sync?: number;
     gas_sheet_name?: string;
@@ -304,7 +304,7 @@ export async function sendToGoogleAppsScript(url: string, payload: any): Promise
 }
 
 export async function testGasConnection(targetUrl?: string, sheetName?: string) {
-  const config = getGasConfig();
+  const config = await getGasConfig();
   const url = targetUrl || config.url;
   const sheet = sheetName || config.sheetName;
 
@@ -347,13 +347,13 @@ export function formatAttendanceForGas(row: any) {
  * Runs in the background so that user check-in / check-out is never delayed.
  */
 export async function syncSingleAttendanceToGas(absensiId: number): Promise<void> {
-  const config = getGasConfig();
+  const config = await getGasConfig();
   if (!config.url || !config.autoSync) {
     return;
   }
 
   // Fetch full joined record
-  const record = queryOne<any>(`
+  const record = await queryOne<any>(`
     SELECT 
       a.*,
       g.nama as nama_guru,
@@ -376,12 +376,12 @@ export async function syncSingleAttendanceToGas(absensiId: number): Promise<void
     const res = await sendToGoogleAppsScript(config.url, payload);
     const now = new Date().toISOString();
     if (res.success) {
-      run("UPDATE absensi SET sync_status = 'synced', synced_at = ? WHERE id = ?", [now, absensiId]);
+      await run("UPDATE absensi SET sync_status = 'synced', synced_at = ? WHERE id = ?", [now, absensiId]);
     } else {
-      run("UPDATE absensi SET sync_status = 'failed' WHERE id = ?", [absensiId]);
+      await run("UPDATE absensi SET sync_status = 'failed' WHERE id = ?", [absensiId]);
     }
   } catch {
-    run("UPDATE absensi SET sync_status = 'failed' WHERE id = ?", [absensiId]);
+    await run("UPDATE absensi SET sync_status = 'failed' WHERE id = ?", [absensiId]);
   }
 }
 
@@ -400,7 +400,7 @@ export async function syncBatchAttendanceToGas(filter?: {
   totalSynced: number;
   data?: any;
 }> {
-  const config = getGasConfig();
+  const config = await getGasConfig();
   if (!config.url) {
     return {
       success: false,
@@ -441,7 +441,7 @@ export async function syncBatchAttendanceToGas(filter?: {
 
   query += " ORDER BY a.tanggal ASC, a.jam_masuk ASC";
 
-  const rows = queryAll<any>(query, params);
+  const rows = await queryAll<any>(query, params);
 
   if (rows.length === 0) {
     return {
@@ -466,7 +466,7 @@ export async function syncBatchAttendanceToGas(filter?: {
     const ids = rows.map((r) => r.id);
     // Mark them all synced
     for (const id of ids) {
-      run("UPDATE absensi SET sync_status = 'synced', synced_at = ? WHERE id = ?", [now, id]);
+      await run("UPDATE absensi SET sync_status = 'synced', synced_at = ? WHERE id = ?", [now, id]);
     }
     return {
       success: true,

@@ -5,7 +5,7 @@ import fs from "fs";
 import jwt from "jsonwebtoken";
 
 const JWT_SECRET = process.env.JWT_SECRET || "absensi_fallback_secret_key_change_me_in_production";
-import { queryAll, queryOne, run, SettingRecord, dbFilePath, saveDb } from "./db.ts";
+import { queryAll, queryOne, run, SettingRecord, dbFilePath, saveDb, isUsingTurso } from "./db.ts";
 import { getWIBDate, calculateDistanceMeters } from "./utils.ts";
 import {
   syncSingleAttendanceToGas,
@@ -61,14 +61,16 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction) {
 // ----------------------------------------------------
 
 // Server info & current time in WIB
-apiRouter.get("/server-info", (req: Request, res: Response) => {
-  const settings = queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1");
+apiRouter.get("/server-info", async (req: Request, res: Response) => {
+  const settings = await queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1");
   const wib = getWIBDate();
   res.json({
     currentTime: wib.timeStr,
     currentDate: wib.dateStr,
     currentDay: wib.dayName,
     timestamp: wib.timestamp,
+    isTurso: isUsingTurso(),
+    databaseType: isUsingTurso() ? "Turso Cloud (Persistent)" : "Local SQLite",
     settings: settings || {
       nama_pondok: "Pondok Pesantren Al Is'af",
       nama_madrasah: "Madrasah Diniyah Miftahul Huda",
@@ -84,7 +86,7 @@ apiRouter.get("/server-info", (req: Request, res: Response) => {
 });
 
 // Login
-apiRouter.post("/auth/login", (req: Request, res: Response) => {
+apiRouter.post("/auth/login", async (req: Request, res: Response) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
@@ -92,7 +94,7 @@ apiRouter.post("/auth/login", (req: Request, res: Response) => {
     return;
   }
 
-  const user = queryOne<{
+  const user = await queryOne<{
     id: number;
     username: string;
     password: string;
@@ -113,7 +115,7 @@ apiRouter.post("/auth/login", (req: Request, res: Response) => {
 
   let teacherDetails: any = null;
   if (user.guru_id) {
-    teacherDetails = queryOne<{
+    teacherDetails = await queryOne<{
       id: number;
       nama: string;
       nip: string;
@@ -163,10 +165,10 @@ export function formatTeacherDbName(nama: string): string {
 }
 
 // Get current profile
-apiRouter.get("/auth/me", authenticate, (req: Request, res: Response) => {
+apiRouter.get("/auth/me", async (req: Request, res: Response) => {
   const sessionUser = (req as any).user as SessionUser;
   if (sessionUser && sessionUser.guru_id) {
-    const teacherDetails = queryOne<{
+    const teacherDetails = await queryOne<{
       id: number;
       nama: string;
       nip: string;
@@ -190,7 +192,7 @@ apiRouter.post("/auth/logout", authenticate, (req: Request, res: Response) => {
 });
 
 // Change Password
-apiRouter.post("/auth/change-password", authenticate, (req: Request, res: Response) => {
+apiRouter.post("/auth/change-password", authenticate, async (req: Request, res: Response) => {
   const user = (req as any).user as SessionUser;
   const { oldPassword, newPassword } = req.body;
 
@@ -204,14 +206,14 @@ apiRouter.post("/auth/change-password", authenticate, (req: Request, res: Respon
     return;
   }
 
-  const dbUser = queryOne<{ password: string }>("SELECT password FROM users WHERE id = ?", [user.id]);
+  const dbUser = await queryOne<{ password: string }>("SELECT password FROM users WHERE id = ?", [user.id]);
   if (!dbUser || !bcrypt.compareSync(oldPassword, dbUser.password)) {
     res.status(400).json({ error: "Password lama tidak sesuai." });
     return;
   }
 
   const newHash = bcrypt.hashSync(newPassword, 10);
-  run("UPDATE users SET password = ? WHERE id = ?", [newHash, user.id]);
+  await run("UPDATE users SET password = ? WHERE id = ?", [newHash, user.id]);
 
   res.json({ message: "Password berhasil diperbarui." });
 });
@@ -221,7 +223,7 @@ apiRouter.post("/auth/change-password", authenticate, (req: Request, res: Respon
 // ----------------------------------------------------
 
 // Check today's status for the logged-in guru
-apiRouter.get("/absensi/today-status", authenticate, (req: Request, res: Response) => {
+apiRouter.get("/absensi/today-status", authenticate, async (req: Request, res: Response) => {
   const user = (req as any).user as SessionUser;
   if (!user.guru_id) {
     res.json({ isTeacher: false, record: null });
@@ -229,12 +231,12 @@ apiRouter.get("/absensi/today-status", authenticate, (req: Request, res: Respons
   }
 
   const { dateStr, timeStr, dayName } = getWIBDate();
-  const record = queryOne(
+  const record = await queryOne(
     "SELECT * FROM absensi WHERE guru_id = ? AND tanggal = ?",
     [user.guru_id, dateStr]
   );
 
-  const settings = queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1");
+  const settings = await queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1");
 
   res.json({
     isTeacher: true,
@@ -247,7 +249,7 @@ apiRouter.get("/absensi/today-status", authenticate, (req: Request, res: Respons
 });
 
 // ABSEN MASUK
-apiRouter.post("/absensi/check-in", authenticate, (req: Request, res: Response) => {
+apiRouter.post("/absensi/check-in", authenticate, async (req: Request, res: Response) => {
   const user = (req as any).user as SessionUser;
   if (!user.guru_id) {
     res.status(403).json({ error: "Hanya akun Guru yang dapat melakukan absensi." });
@@ -262,8 +264,8 @@ apiRouter.post("/absensi/check-in", authenticate, (req: Request, res: Response) 
 
   const { dateStr, timeStr, dayName, timestamp } = getWIBDate();
 
-  // Rule 13: "Guru tidak dapat melakukan absensi masuk dua kali pada tanggal/jadwal yang sama."
-  const existing = queryOne(
+  // Guru tidak dapat melakukan absensi masuk dua kali pada tanggal yang sama
+  const existing = await queryOne<any>(
     "SELECT id, status, jam_masuk FROM absensi WHERE guru_id = ? AND tanggal = ?",
     [user.guru_id, dateStr]
   );
@@ -276,7 +278,7 @@ apiRouter.post("/absensi/check-in", authenticate, (req: Request, res: Response) 
   }
 
   // Load school settings
-  const settings = queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1") || {
+  const settings = (await queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1")) || {
     id: 1,
     nama_pondok: "Pondok Pesantren Al Is'af",
     nama_madrasah: "Madrasah Diniyah Miftahul Huda",
@@ -315,8 +317,6 @@ apiRouter.post("/absensi/check-in", authenticate, (req: Request, res: Response) 
   if (jenisKehadiran && ["IZIN", "SAKIT", "DINAS", "TUGAS PONDOK"].includes(jenisKehadiran.toUpperCase())) {
     finalStatus = jenisKehadiran.toUpperCase();
   } else {
-    // Compare timeStr with batas_terlambat (e.g. 20:05)
-    // Both are in "HH:mm" or "HH:mm:ss" string format
     const currentTimeClean = timeStr.substring(0, 5); // "HH:mm"
     const batasClean = settings.batas_terlambat.substring(0, 5);
 
@@ -332,7 +332,7 @@ apiRouter.post("/absensi/check-in", authenticate, (req: Request, res: Response) 
     : `Jarak: ${distance} m dari titik pondok`;
 
   // Insert to relational table
-  run(
+  await run(
     `INSERT INTO absensi (
       guru_id, tanggal, hari, jam_masuk, status,
       latitude_masuk, longitude_masuk, lokasi_masuk, keterangan_masuk,
@@ -355,7 +355,7 @@ apiRouter.post("/absensi/check-in", authenticate, (req: Request, res: Response) 
     ]
   );
 
-  const inserted = queryOne<any>("SELECT * FROM absensi WHERE guru_id = ? AND tanggal = ?", [
+  const inserted = await queryOne<any>("SELECT * FROM absensi WHERE guru_id = ? AND tanggal = ?", [
     user.guru_id,
     dateStr,
   ]);
@@ -377,7 +377,7 @@ apiRouter.post("/absensi/check-in", authenticate, (req: Request, res: Response) 
 });
 
 // ABSEN PULANG
-apiRouter.post("/absensi/check-out", authenticate, (req: Request, res: Response) => {
+apiRouter.post("/absensi/check-out", authenticate, async (req: Request, res: Response) => {
   const user = (req as any).user as SessionUser;
   if (!user.guru_id) {
     res.status(403).json({ error: "Hanya akun Guru yang dapat melakukan absensi." });
@@ -390,8 +390,7 @@ apiRouter.post("/absensi/check-out", authenticate, (req: Request, res: Response)
 
   const { dateStr, timeStr, timestamp } = getWIBDate();
 
-  // Rule 13: "Guru tidak dapat melakukan absensi pulang sebelum melakukan absensi masuk."
-  const existing = queryOne<{
+  const existing = await queryOne<{
     id: number;
     jam_masuk: string;
     jam_pulang: string | null;
@@ -407,7 +406,6 @@ apiRouter.post("/absensi/check-out", authenticate, (req: Request, res: Response)
     return;
   }
 
-  // Rule 13: "Guru tidak dapat melakukan absensi pulang dua kali."
   if (existing.jam_pulang) {
     res.status(400).json({
       error: `Anda sudah melakukan absensi pulang hari ini pada pukul ${existing.jam_pulang}.`,
@@ -415,7 +413,7 @@ apiRouter.post("/absensi/check-out", authenticate, (req: Request, res: Response)
     return;
   }
 
-  const settings = queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1") || {
+  const settings = (await queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1")) || {
     id: 1,
     nama_pondok: "Pondok Pesantren Al Is'af",
     nama_madrasah: "Madrasah Diniyah Miftahul Huda",
@@ -450,7 +448,7 @@ apiRouter.post("/absensi/check-out", authenticate, (req: Request, res: Response)
     ? `${keterangan.trim()} (Jarak pulang: ${distance} m)`
     : `Jarak: ${distance} m dari titik pondok`;
 
-  run(
+  await run(
     `UPDATE absensi SET
       jam_pulang = ?,
       latitude_pulang = ?,
@@ -462,7 +460,7 @@ apiRouter.post("/absensi/check-out", authenticate, (req: Request, res: Response)
     [timeStr, latNum, lngNum, lokasiKeterangan, pulangKet, timestamp, existing.id]
   );
 
-  const updated = queryOne("SELECT * FROM absensi WHERE id = ?", [existing.id]);
+  const updated = await queryOne("SELECT * FROM absensi WHERE id = ?", [existing.id]);
 
   // Sync to Google Apps Script in background
   syncSingleAttendanceToGas(existing.id).catch((err) => {
@@ -479,7 +477,7 @@ apiRouter.post("/absensi/check-out", authenticate, (req: Request, res: Response)
 });
 
 // Guru's personal attendance history
-apiRouter.get("/absensi/my-history", authenticate, (req: Request, res: Response) => {
+apiRouter.get("/absensi/my-history", authenticate, async (req: Request, res: Response) => {
   const user = (req as any).user as SessionUser;
   if (!user.guru_id) {
     res.status(403).json({ error: "Fitur ini hanya untuk akun Guru." });
@@ -502,7 +500,7 @@ apiRouter.get("/absensi/my-history", authenticate, (req: Request, res: Response)
 
   sql += ` ORDER BY a.tanggal DESC, a.jam_masuk DESC`;
 
-  const rows = queryAll(sql, params);
+  const rows = await queryAll(sql, params);
   res.json({ records: rows });
 });
 
@@ -511,15 +509,15 @@ apiRouter.get("/absensi/my-history", authenticate, (req: Request, res: Response)
 // ----------------------------------------------------
 
 // Admin Dashboard statistics
-apiRouter.get("/admin/dashboard-stats", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.get("/admin/dashboard-stats", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { dateStr } = getWIBDate();
 
   // Total active teachers
-  const totalGuruRow = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM guru WHERE status = 'Aktif'");
+  const totalGuruRow = await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM guru WHERE status = 'Aktif'");
   const totalGuru = totalGuruRow ? totalGuruRow.count : 0;
 
   // Today's attendance records
-  const todayRecords = queryAll<any>(
+  const todayRecords = await queryAll<any>(
     `SELECT a.*, g.nama, g.nip, g.mata_pelajaran
      FROM absensi a
      JOIN guru g ON a.guru_id = g.id
@@ -556,14 +554,14 @@ apiRouter.get("/admin/dashboard-stats", authenticate, requireAdmin, (req: Reques
     const dStr = d.toISOString().split("T")[0];
     const dayLabel = `${dayNames[d.getDay()]}, ${d.getDate()}/${d.getMonth() + 1}`;
 
-    const stats = queryOne<{ tepat: number; lambat: number; izin: number }>(
+    const stats = (await queryOne<{ tepat: number; lambat: number; izin: number }>(
       `SELECT 
         SUM(CASE WHEN status = 'MASUK' THEN 1 ELSE 0 END) as tepat,
         SUM(CASE WHEN status = 'TERLAMBAT' THEN 1 ELSE 0 END) as lambat,
         SUM(CASE WHEN status IN ('IZIN','SAKIT','TIDAK MASUK') THEN 1 ELSE 0 END) as izin
        FROM absensi WHERE tanggal = ?`,
       [dStr]
-    ) || { tepat: 0, lambat: 0, izin: 0 };
+    )) || { tepat: 0, lambat: 0, izin: 0 };
 
     chartData.push({
       date: dStr,
@@ -590,11 +588,11 @@ apiRouter.get("/admin/dashboard-stats", authenticate, requireAdmin, (req: Reques
 });
 
 // Admin Today's Attendance list (with missing teachers marked as Belum Absen)
-apiRouter.get("/admin/today-attendance", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.get("/admin/today-attendance", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { dateStr } = getWIBDate();
 
-  const allTeachers = queryAll<any>("SELECT * FROM guru WHERE status = 'Aktif' ORDER BY nama ASC");
-  const attendanceToday = queryAll<any>("SELECT * FROM absensi WHERE tanggal = ?", [dateStr]);
+  const allTeachers = await queryAll<any>("SELECT * FROM guru WHERE status = 'Aktif' ORDER BY nama ASC");
+  const attendanceToday = await queryAll<any>("SELECT * FROM absensi WHERE tanggal = ?", [dateStr]);
 
   const map = new Map<number, any>();
   attendanceToday.forEach((att) => map.set(att.guru_id, att));
@@ -625,7 +623,7 @@ apiRouter.get("/admin/today-attendance", authenticate, requireAdmin, (req: Reque
 });
 
 // Admin Recap Table with Search, Filter, Sort, Pagination
-apiRouter.get("/admin/rekap", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.get("/admin/rekap", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const {
     search,
     tanggal,
@@ -680,7 +678,7 @@ apiRouter.get("/admin/rekap", authenticate, requireAdmin, (req: Request, res: Re
   const whereStr = whereClauses.join(" AND ");
 
   // Count total records
-  const countRow = queryOne<{ count: number }>(
+  const countRow = await queryOne<{ count: number }>(
     `SELECT COUNT(*) as count 
      FROM absensi a 
      JOIN guru g ON a.guru_id = g.id 
@@ -696,7 +694,7 @@ apiRouter.get("/admin/rekap", authenticate, requireAdmin, (req: Request, res: Re
 
   const sortOrder = sort === "asc" ? "ASC" : "DESC";
 
-  const rows = queryAll<any>(
+  const rows = await queryAll<any>(
     `SELECT a.*, g.nama as nama_guru, g.nip, g.mata_pelajaran, g.no_hp
      FROM absensi a
      JOIN guru g ON a.guru_id = g.id
@@ -718,7 +716,7 @@ apiRouter.get("/admin/rekap", authenticate, requireAdmin, (req: Request, res: Re
 });
 
 // Admin Monthly Recap Aggregation
-apiRouter.get("/admin/monthly-rekap", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.get("/admin/monthly-rekap", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { bulan, tahun, guru_id } = req.query;
 
   const now = new Date();
@@ -734,50 +732,52 @@ apiRouter.get("/admin/monthly-rekap", authenticate, requireAdmin, (req: Request,
   }
   guruQuery += " ORDER BY nama ASC";
 
-  const teachers = queryAll<any>(guruQuery, guruParams);
+  const teachers = await queryAll<any>(guruQuery, guruParams);
 
-  const report = teachers.map((t, idx) => {
-    const stats = queryOne<{
-      total_hadir: number;
-      tepat_waktu: number;
-      terlambat: number;
-      tidak_masuk: number;
-      di_dalam: number;
-      di_luar: number;
-    }>(
-      `SELECT 
-        COUNT(CASE WHEN status IN ('MASUK', 'TERLAMBAT') THEN 1 END) as total_hadir,
-        COUNT(CASE WHEN status = 'MASUK' THEN 1 END) as tepat_waktu,
-        COUNT(CASE WHEN status = 'TERLAMBAT' THEN 1 END) as terlambat,
-        COUNT(CASE WHEN status IN ('IZIN', 'SAKIT', 'TIDAK MASUK') THEN 1 END) as tidak_masuk,
-        COUNT(CASE WHEN lokasi_masuk = 'DI DALAM PONDOK' THEN 1 END) as di_dalam,
-        COUNT(CASE WHEN lokasi_masuk = 'DI LUAR PONDOK' THEN 1 END) as di_luar
-       FROM absensi 
-       WHERE guru_id = ? AND tanggal LIKE ?`,
-      [t.id, `${monthPrefix}%`]
-    ) || {
-      total_hadir: 0,
-      tepat_waktu: 0,
-      terlambat: 0,
-      tidak_masuk: 0,
-      di_dalam: 0,
-      di_luar: 0,
-    };
+  const report = await Promise.all(
+    teachers.map(async (t, idx) => {
+      const stats = (await queryOne<{
+        total_hadir: number;
+        tepat_waktu: number;
+        terlambat: number;
+        tidak_masuk: number;
+        di_dalam: number;
+        di_luar: number;
+      }>(
+        `SELECT 
+          COUNT(CASE WHEN status IN ('MASUK', 'TERLAMBAT') THEN 1 END) as total_hadir,
+          COUNT(CASE WHEN status = 'MASUK' THEN 1 END) as tepat_waktu,
+          COUNT(CASE WHEN status = 'TERLAMBAT' THEN 1 END) as terlambat,
+          COUNT(CASE WHEN status IN ('IZIN', 'SAKIT', 'TIDAK MASUK') THEN 1 END) as tidak_masuk,
+          COUNT(CASE WHEN lokasi_masuk = 'DI DALAM PONDOK' THEN 1 END) as di_dalam,
+          COUNT(CASE WHEN lokasi_masuk = 'DI LUAR PONDOK' THEN 1 END) as di_luar
+         FROM absensi 
+         WHERE guru_id = ? AND tanggal LIKE ?`,
+        [t.id, `${monthPrefix}%`]
+      )) || {
+        total_hadir: 0,
+        tepat_waktu: 0,
+        terlambat: 0,
+        tidak_masuk: 0,
+        di_dalam: 0,
+        di_luar: 0,
+      };
 
-    return {
-      no: idx + 1,
-      guru_id: t.id,
-      nama: t.nama,
-      nip: t.nip || "-",
-      mata_pelajaran: t.mata_pelajaran,
-      jumlah_hadir: stats.total_hadir || 0,
-      tepat_waktu: stats.tepat_waktu || 0,
-      terlambat: stats.terlambat || 0,
-      tidak_masuk: stats.tidak_masuk || 0,
-      di_dalam_pondok: stats.di_dalam || 0,
-      di_luar_pondok: stats.di_luar || 0,
-    };
-  });
+      return {
+        no: idx + 1,
+        guru_id: t.id,
+        nama: t.nama,
+        nip: t.nip || "-",
+        mata_pelajaran: t.mata_pelajaran,
+        jumlah_hadir: stats.total_hadir || 0,
+        tepat_waktu: stats.tepat_waktu || 0,
+        terlambat: stats.terlambat || 0,
+        tidak_masuk: stats.tidak_masuk || 0,
+        di_dalam_pondok: stats.di_dalam || 0,
+        di_luar_pondok: stats.di_luar || 0,
+      };
+    })
+  );
 
   res.json({
     bulan: selectedMonth,
@@ -787,7 +787,7 @@ apiRouter.get("/admin/monthly-rekap", authenticate, requireAdmin, (req: Request,
 });
 
 // Admin Manual Attendance entry (for corrections/leaves)
-apiRouter.post("/admin/absensi/manual", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.post("/admin/absensi/manual", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { guru_id, tanggal, jam_masuk, jam_pulang, status, lokasi_masuk, keterangan } = req.body;
 
   if (!guru_id || !tanggal || !status) {
@@ -801,13 +801,13 @@ apiRouter.post("/admin/absensi/manual", authenticate, requireAdmin, (req: Reques
   const timestamp = `${tanggal} ${jam_masuk || "20:00:00"}`;
 
   // Check if record exists for that date
-  const existing = queryOne<{ id: number }>("SELECT id FROM absensi WHERE guru_id = ? AND tanggal = ?", [
+  const existing = await queryOne<{ id: number }>("SELECT id FROM absensi WHERE guru_id = ? AND tanggal = ?", [
     guru_id,
     tanggal,
   ]);
 
   if (existing) {
-    run(
+    await run(
       `UPDATE absensi SET
         jam_masuk = ?,
         jam_pulang = ?,
@@ -829,7 +829,7 @@ apiRouter.post("/admin/absensi/manual", authenticate, requireAdmin, (req: Reques
     syncSingleAttendanceToGas(existing.id).catch(() => {});
     res.json({ message: "Data absensi berhasil diperbarui." });
   } else {
-    run(
+    await run(
       `INSERT INTO absensi (
         guru_id, tanggal, hari, jam_masuk, status,
         lokasi_masuk, jam_pulang, lokasi_pulang, keterangan, created_at, updated_at
@@ -848,7 +848,7 @@ apiRouter.post("/admin/absensi/manual", authenticate, requireAdmin, (req: Reques
         timestamp,
       ]
     );
-    const newRecord = queryOne<{ id: number }>("SELECT id FROM absensi WHERE guru_id = ? AND tanggal = ?", [guru_id, tanggal]);
+    const newRecord = await queryOne<{ id: number }>("SELECT id FROM absensi WHERE guru_id = ? AND tanggal = ?", [guru_id, tanggal]);
     if (newRecord?.id) {
       syncSingleAttendanceToGas(newRecord.id).catch(() => {});
     }
@@ -857,9 +857,9 @@ apiRouter.post("/admin/absensi/manual", authenticate, requireAdmin, (req: Reques
 });
 
 // Admin Delete Attendance Record
-apiRouter.delete("/admin/absensi/:id", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.delete("/admin/absensi/:id", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { id } = req.params;
-  run("DELETE FROM absensi WHERE id = ?", [id]);
+  await run("DELETE FROM absensi WHERE id = ?", [id]);
   res.json({ message: "Data absensi berhasil dihapus." });
 });
 
@@ -867,7 +867,7 @@ apiRouter.delete("/admin/absensi/:id", authenticate, requireAdmin, (req: Request
 // Guru Management Endpoints (Admin)
 // ----------------------------------------------------
 
-export function generateUniqueUsername(nama: string, nip?: string, existingGuruId?: number): string {
+export async function generateUniqueUsername(nama: string, nip?: string, existingGuruId?: number): Promise<string> {
   let base = "";
   if (nip && nip.trim().length >= 4) {
     base = nip.trim().replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
@@ -886,8 +886,8 @@ export function generateUniqueUsername(nama: string, nip?: string, existingGuruI
   let counter = 1;
   while (true) {
     const existing = existingGuruId
-      ? queryOne<{ id: number }>("SELECT id FROM users WHERE username = ? AND (guru_id IS NULL OR guru_id != ?)", [candidate, existingGuruId])
-      : queryOne<{ id: number }>("SELECT id FROM users WHERE username = ?", [candidate]);
+      ? await queryOne<{ id: number }>("SELECT id FROM users WHERE username = ? AND (guru_id IS NULL OR guru_id != ?)", [candidate, existingGuruId])
+      : await queryOne<{ id: number }>("SELECT id FROM users WHERE username = ?", [candidate]);
     
     if (!existing) {
       return candidate;
@@ -897,9 +897,9 @@ export function generateUniqueUsername(nama: string, nip?: string, existingGuruI
   }
 }
 
-apiRouter.get("/admin/guru", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.get("/admin/guru", authenticate, requireAdmin, async (req: Request, res: Response) => {
   // Auto-repair any guru missing users account or with empty username
-  const unlinkedGurus = queryAll<{ id: number; nama: string; nip: string }>(
+  const unlinkedGurus = await queryAll<{ id: number; nama: string; nip: string }>(
     `SELECT g.id, g.nama, g.nip 
      FROM guru g 
      LEFT JOIN users u ON u.guru_id = g.id 
@@ -908,12 +908,12 @@ apiRouter.get("/admin/guru", authenticate, requireAdmin, (req: Request, res: Res
   if (unlinkedGurus.length > 0) {
     const defaultPassHash = bcrypt.hashSync("guru123", 10);
     for (const g of unlinkedGurus) {
-      const uname = generateUniqueUsername(g.nama, g.nip, g.id);
-      const existingUser = queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [g.id]);
+      const uname = await generateUniqueUsername(g.nama, g.nip, g.id);
+      const existingUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [g.id]);
       if (existingUser) {
-        run("UPDATE users SET username = ? WHERE id = ?", [uname, existingUser.id]);
+        await run("UPDATE users SET username = ? WHERE id = ?", [uname, existingUser.id]);
       } else {
-        run(
+        await run(
           "INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)",
           [uname, defaultPassHash, g.id]
         );
@@ -921,7 +921,7 @@ apiRouter.get("/admin/guru", authenticate, requireAdmin, (req: Request, res: Res
     }
   }
 
-  const teachers = queryAll<any>(
+  const teachers = await queryAll<any>(
     `SELECT g.*, u.username, u.id as user_id
      FROM guru g
      LEFT JOIN users u ON u.guru_id = g.id
@@ -930,7 +930,7 @@ apiRouter.get("/admin/guru", authenticate, requireAdmin, (req: Request, res: Res
   res.json({ data: teachers });
 });
 
-apiRouter.post("/admin/guru", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.post("/admin/guru", authenticate, requireAdmin, async (req: Request, res: Response) => {
   let { nama, nip, no_hp, mata_pelajaran, username, password } = req.body;
 
   if (!nama || !nama.trim()) {
@@ -941,10 +941,10 @@ apiRouter.post("/admin/guru", authenticate, requireAdmin, (req: Request, res: Re
   // Auto-generate username if not provided or empty
   let finalUsername = username ? username.trim().toLowerCase() : "";
   if (!finalUsername) {
-    finalUsername = generateUniqueUsername(nama, nip);
+    finalUsername = await generateUniqueUsername(nama, nip);
   } else {
     // Check username unique
-    const userExists = queryOne("SELECT id FROM users WHERE username = ?", [finalUsername]);
+    const userExists = await queryOne("SELECT id FROM users WHERE username = ?", [finalUsername]);
     if (userExists) {
       res.status(400).json({ error: `Username "${finalUsername}" sudah digunakan oleh guru/pengguna lain.` });
       return;
@@ -954,25 +954,24 @@ apiRouter.post("/admin/guru", authenticate, requireAdmin, (req: Request, res: Re
   const finalPassword = password && password.trim() ? password.trim() : "guru123";
   const formattedNama = formatTeacherDbName(nama);
 
-  const insertResult = run(
+  const insertResult = await run(
     "INSERT INTO guru (nama, nip, no_hp, mata_pelajaran, status) VALUES (?, ?, ?, ?, 'Aktif')",
     [formattedNama, nip ? nip.trim() : "", no_hp ? no_hp.trim() : "", mata_pelajaran ? mata_pelajaran.trim() : ""]
   );
 
   let newGuruId = insertResult.lastInsertRowid;
   if (!newGuruId || newGuruId === 0) {
-    const found = queryOne<{ id: number }>("SELECT id FROM guru WHERE nama = ? ORDER BY id DESC LIMIT 1", [formattedNama]);
+    const found = await queryOne<{ id: number }>("SELECT id FROM guru WHERE nama = ? ORDER BY id DESC LIMIT 1", [formattedNama]);
     if (found) newGuruId = found.id;
   }
 
   if (newGuruId) {
     const hash = bcrypt.hashSync(finalPassword, 10);
-    // Check if user already exists for this guru_id
-    const existingUser = queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [newGuruId]);
+    const existingUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [newGuruId]);
     if (existingUser) {
-      run("UPDATE users SET username = ?, password = ? WHERE id = ?", [finalUsername, hash, existingUser.id]);
+      await run("UPDATE users SET username = ?, password = ? WHERE id = ?", [finalUsername, hash, existingUser.id]);
     } else {
-      run(
+      await run(
         "INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)",
         [finalUsername, hash, newGuruId]
       );
@@ -986,7 +985,7 @@ apiRouter.post("/admin/guru", authenticate, requireAdmin, (req: Request, res: Re
   });
 });
 
-apiRouter.put("/admin/guru/:id", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.put("/admin/guru/:id", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { id } = req.params;
   let { nama, nip, no_hp, mata_pelajaran, status, username } = req.body;
 
@@ -997,18 +996,18 @@ apiRouter.put("/admin/guru/:id", authenticate, requireAdmin, (req: Request, res:
 
   const formattedNama = formatTeacherDbName(nama);
 
-  run(
+  await run(
     "UPDATE guru SET nama = ?, nip = ?, no_hp = ?, mata_pelajaran = ?, status = ? WHERE id = ?",
     [formattedNama, nip || "", no_hp || "", mata_pelajaran || "", status || "Aktif", id]
   );
 
   let finalUsername = username ? username.trim().toLowerCase() : "";
   if (!finalUsername) {
-    finalUsername = generateUniqueUsername(nama, nip, Number(id));
+    finalUsername = await generateUniqueUsername(nama, nip, Number(id));
   }
 
   // Check if another user uses this username
-  const exists = queryOne<{ id: number }>(
+  const exists = await queryOne<{ id: number }>(
     "SELECT id FROM users WHERE username = ? AND guru_id != ?",
     [finalUsername, id]
   );
@@ -1017,12 +1016,12 @@ apiRouter.put("/admin/guru/:id", authenticate, requireAdmin, (req: Request, res:
     return;
   }
 
-  const existingUser = queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [id]);
+  const existingUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE guru_id = ?", [id]);
   if (existingUser) {
-    run("UPDATE users SET username = ? WHERE id = ?", [finalUsername, existingUser.id]);
+    await run("UPDATE users SET username = ? WHERE id = ?", [finalUsername, existingUser.id]);
   } else {
     const defaultHash = bcrypt.hashSync("guru123", 10);
-    run(
+    await run(
       "INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)",
       [finalUsername, defaultHash, id]
     );
@@ -1031,7 +1030,7 @@ apiRouter.put("/admin/guru/:id", authenticate, requireAdmin, (req: Request, res:
   res.json({ message: "Data guru dan akun login berhasil diperbarui.", username: finalUsername });
 });
 
-apiRouter.post("/admin/guru/:id/reset-password", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.post("/admin/guru/:id/reset-password", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { id } = req.params;
   const { newPassword } = req.body;
 
@@ -1041,16 +1040,16 @@ apiRouter.post("/admin/guru/:id/reset-password", authenticate, requireAdmin, (re
   }
 
   const hash = bcrypt.hashSync(newPassword, 10);
-  run("UPDATE users SET password = ? WHERE guru_id = ?", [hash, id]);
+  await run("UPDATE users SET password = ? WHERE guru_id = ?", [hash, id]);
 
   res.json({ message: "Password guru berhasil direset." });
 });
 
-apiRouter.delete("/admin/guru/:id", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.delete("/admin/guru/:id", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { id } = req.params;
-  run("DELETE FROM users WHERE guru_id = ?", [id]);
-  run("DELETE FROM absensi WHERE guru_id = ?", [id]);
-  run("DELETE FROM guru WHERE id = ?", [id]);
+  await run("DELETE FROM users WHERE guru_id = ?", [id]);
+  await run("DELETE FROM absensi WHERE guru_id = ?", [id]);
+  await run("DELETE FROM guru WHERE id = ?", [id]);
   res.json({ message: "Data guru beserta riwayatnya berhasil dihapus." });
 });
 
@@ -1058,8 +1057,8 @@ apiRouter.delete("/admin/guru/:id", authenticate, requireAdmin, (req: Request, r
 // User / Account Management (Admin)
 // ----------------------------------------------------
 
-apiRouter.get("/admin/users", authenticate, requireAdmin, (req: Request, res: Response) => {
-  const users = queryAll<any>(
+apiRouter.get("/admin/users", authenticate, requireAdmin, async (req: Request, res: Response) => {
+  const users = await queryAll<any>(
     `SELECT u.id, u.username, u.role, u.guru_id, g.nama as nama_guru 
      FROM users u 
      LEFT JOIN guru g ON u.guru_id = g.id 
@@ -1072,12 +1071,12 @@ apiRouter.get("/admin/users", authenticate, requireAdmin, (req: Request, res: Re
 // Settings Endpoints
 // ----------------------------------------------------
 
-apiRouter.get("/settings", (req: Request, res: Response) => {
-  const settings = queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1");
+apiRouter.get("/settings", async (req: Request, res: Response) => {
+  const settings = await queryOne<SettingRecord>("SELECT * FROM pengaturan WHERE id = 1");
   res.json({ data: settings });
 });
 
-apiRouter.put("/admin/settings", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.put("/admin/settings", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const {
     nama_pondok,
     nama_madrasah,
@@ -1099,7 +1098,7 @@ apiRouter.put("/admin/settings", authenticate, requireAdmin, (req: Request, res:
     return;
   }
 
-  run(
+  await run(
     `UPDATE pengaturan SET
       nama_pondok = ?,
       nama_madrasah = ?,
@@ -1132,15 +1131,15 @@ apiRouter.put("/admin/settings", authenticate, requireAdmin, (req: Request, res:
     ]
   );
 
-  const updated = queryOne("SELECT * FROM pengaturan WHERE id = 1");
+  const updated = await queryOne("SELECT * FROM pengaturan WHERE id = 1");
   res.json({ message: "Pengaturan berhasil disimpan.", data: updated });
 });
 
 // Update Logo Pondok Only (Instant apply)
-apiRouter.post("/admin/pengaturan/logo", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.post("/admin/pengaturan/logo", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const { logo_url } = req.body;
-  run("UPDATE pengaturan SET logo_url = ? WHERE id = 1", [logo_url ? String(logo_url) : ""]);
-  const updated = queryOne("SELECT * FROM pengaturan WHERE id = 1");
+  await run("UPDATE pengaturan SET logo_url = ? WHERE id = 1", [logo_url ? String(logo_url) : ""]);
+  const updated = await queryOne("SELECT * FROM pengaturan WHERE id = 1");
   res.json({ message: "Logo pondok berhasil diperbarui.", data: updated });
 });
 
@@ -1175,10 +1174,10 @@ apiRouter.post("/admin/gas/sync", authenticate, requireAdmin, async (req: Reques
 });
 
 // Get Google Apps Script Code Template and sync info
-apiRouter.get("/admin/gas/info", authenticate, requireAdmin, (req: Request, res: Response) => {
-  const config = getGasConfig();
-  const totalCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM absensi")?.count || 0;
-  const syncedCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM absensi WHERE sync_status = 'synced'")?.count || 0;
+apiRouter.get("/admin/gas/info", authenticate, requireAdmin, async (req: Request, res: Response) => {
+  const config = await getGasConfig();
+  const totalCount = (await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM absensi"))?.count || 0;
+  const syncedCount = (await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM absensi WHERE sync_status = 'synced'"))?.count || 0;
   const pendingCount = totalCount - syncedCount;
 
   res.json({
@@ -1195,7 +1194,7 @@ apiRouter.get("/admin/gas/info", authenticate, requireAdmin, (req: Request, res:
 // ==================== JADWAL PELAJARAN (REMINDER & SCHEDULE) ====================
 
 // Get all schedules with filters
-apiRouter.get("/jadwal", authenticate, (req: Request, res: Response) => {
+apiRouter.get("/jadwal", authenticate, async (req: Request, res: Response) => {
   const { hari, guru_id, kelas, search } = req.query;
 
   let query = `
@@ -1245,12 +1244,12 @@ apiRouter.get("/jadwal", authenticate, (req: Request, res: Response) => {
     j.jam_mulai ASC
   `;
 
-  const rows = queryAll(query, params);
+  const rows = await queryAll(query, params);
   res.json({ data: rows });
 });
 
 // Get today's schedule reminder
-apiRouter.get("/jadwal/today", authenticate, (req: Request, res: Response) => {
+apiRouter.get("/jadwal/today", authenticate, async (req: Request, res: Response) => {
   const user = (req as any).user as SessionUser;
   const { dateStr, timeStr, dayName } = getWIBDate();
 
@@ -1274,41 +1273,43 @@ apiRouter.get("/jadwal/today", authenticate, (req: Request, res: Response) => {
 
   query += " ORDER BY j.jam_mulai ASC";
 
-  const schedules = queryAll<any>(query, params);
+  const schedules = await queryAll<any>(query, params);
 
   // Attach teacher's attendance status today as reminder
-  const enriched = schedules.map((item) => {
-    const attendance = queryOne<{
-      id: number;
-      jam_masuk: string;
-      jam_pulang: string;
-      status: string;
-      lokasi_masuk: string;
-    }>(
-      "SELECT id, jam_masuk, jam_pulang, status, lokasi_masuk FROM absensi WHERE guru_id = ? AND tanggal = ?",
-      [item.guru_id, dateStr]
-    );
+  const enriched = await Promise.all(
+    schedules.map(async (item) => {
+      const attendance = await queryOne<{
+        id: number;
+        jam_masuk: string;
+        jam_pulang: string;
+        status: string;
+        lokasi_masuk: string;
+      }>(
+        "SELECT id, jam_masuk, jam_pulang, status, lokasi_masuk FROM absensi WHERE guru_id = ? AND tanggal = ?",
+        [item.guru_id, dateStr]
+      );
 
-    let timingStatus: "upcoming" | "active" | "completed" = "upcoming";
-    const nowHHMM = timeStr.substring(0, 5);
-    const startHHMM = item.jam_mulai.substring(0, 5);
-    const endHHMM = item.jam_selesai.substring(0, 5);
+      let timingStatus: "upcoming" | "active" | "completed" = "upcoming";
+      const nowHHMM = timeStr.substring(0, 5);
+      const startHHMM = item.jam_mulai.substring(0, 5);
+      const endHHMM = item.jam_selesai.substring(0, 5);
 
-    if (nowHHMM >= startHHMM && nowHHMM <= endHHMM) {
-      timingStatus = "active";
-    } else if (nowHHMM > endHHMM) {
-      timingStatus = "completed";
-    } else {
-      timingStatus = "upcoming";
-    }
+      if (nowHHMM >= startHHMM && nowHHMM <= endHHMM) {
+        timingStatus = "active";
+      } else if (nowHHMM > endHHMM) {
+        timingStatus = "completed";
+      } else {
+        timingStatus = "upcoming";
+      }
 
-    return {
-      ...item,
-      attendance: attendance || null,
-      sudah_absen: !!attendance,
-      timingStatus,
-    };
-  });
+      return {
+        ...item,
+        attendance: attendance || null,
+        sudah_absen: !!attendance,
+        timingStatus,
+      };
+    })
+  );
 
   res.json({
     day: dayName,
@@ -1319,7 +1320,7 @@ apiRouter.get("/jadwal/today", authenticate, (req: Request, res: Response) => {
 });
 
 // Admin Add Schedule
-apiRouter.post("/admin/jadwal", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.post("/admin/jadwal", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const {
     guru_id,
     mata_pelajaran,
@@ -1337,7 +1338,7 @@ apiRouter.post("/admin/jadwal", authenticate, requireAdmin, (req: Request, res: 
     return;
   }
 
-  const result = run(
+  const result = await run(
     `INSERT INTO jadwal_pelajaran (guru_id, mata_pelajaran, kitab, kelas, hari, jam_mulai, jam_selesai, ruangan, keterangan)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
@@ -1357,7 +1358,7 @@ apiRouter.post("/admin/jadwal", authenticate, requireAdmin, (req: Request, res: 
 });
 
 // Admin Update Schedule
-apiRouter.put("/admin/jadwal/:id", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.put("/admin/jadwal/:id", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const id = parseInt(req.params.id);
   const {
     guru_id,
@@ -1376,7 +1377,7 @@ apiRouter.put("/admin/jadwal/:id", authenticate, requireAdmin, (req: Request, re
     return;
   }
 
-  run(
+  await run(
     `UPDATE jadwal_pelajaran SET
       guru_id = ?,
       mata_pelajaran = ?,
@@ -1406,20 +1407,20 @@ apiRouter.put("/admin/jadwal/:id", authenticate, requireAdmin, (req: Request, re
 });
 
 // Admin Delete Schedule
-apiRouter.delete("/admin/jadwal/:id", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.delete("/admin/jadwal/:id", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const id = parseInt(req.params.id);
-  run("DELETE FROM jadwal_pelajaran WHERE id = ?", [id]);
+  await run("DELETE FROM jadwal_pelajaran WHERE id = ?", [id]);
   res.json({ message: "Jadwal pelajaran berhasil dihapus." });
 });
 
 // ==================== BACKUP & RESTORE DATA ====================
 
 // Get overview stats of data for backup info
-apiRouter.get("/admin/backup/stats", authenticate, requireAdmin, (req: Request, res: Response) => {
-  const guruCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM guru")?.count || 0;
-  const usersCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM users")?.count || 0;
-  const jadwalCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM jadwal_pelajaran")?.count || 0;
-  const absensiCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM absensi")?.count || 0;
+apiRouter.get("/admin/backup/stats", authenticate, requireAdmin, async (req: Request, res: Response) => {
+  const guruCount = (await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM guru"))?.count || 0;
+  const usersCount = (await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM users"))?.count || 0;
+  const jadwalCount = (await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM jadwal_pelajaran"))?.count || 0;
+  const absensiCount = (await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM absensi"))?.count || 0;
   
   let sqliteSize = 0;
   try {
@@ -1434,18 +1435,20 @@ apiRouter.get("/admin/backup/stats", authenticate, requireAdmin, (req: Request, 
     jadwalCount,
     absensiCount,
     sqliteSize,
-    databaseFile: "data/absensi.sqlite",
+    isTurso: isUsingTurso(),
+    databaseType: isUsingTurso() ? "Turso Cloud SQLite (Permanen Cloud)" : "Local SQLite File",
+    databaseFile: isUsingTurso() ? "Turso Cloud Database" : "data/absensi.sqlite",
     lastBackupRecommendation: "Disarankan mengunduh backup secara berkala sebelum melakukan pembaruan atau tutup semester.",
   });
 });
 
 // Export complete JSON backup
-apiRouter.get("/admin/backup/export-json", authenticate, requireAdmin, (req: Request, res: Response) => {
-  const pengaturan = queryAll("SELECT * FROM pengaturan");
-  const guru = queryAll("SELECT * FROM guru");
-  const users = queryAll("SELECT id, username, password, role, guru_id FROM users");
-  const jadwal_pelajaran = queryAll("SELECT * FROM jadwal_pelajaran");
-  const absensi = queryAll("SELECT * FROM absensi");
+apiRouter.get("/admin/backup/export-json", authenticate, requireAdmin, async (req: Request, res: Response) => {
+  const pengaturan = await queryAll("SELECT * FROM pengaturan");
+  const guru = await queryAll("SELECT * FROM guru");
+  const users = await queryAll("SELECT id, username, password, role, guru_id FROM users");
+  const jadwal_pelajaran = await queryAll("SELECT * FROM jadwal_pelajaran");
+  const absensi = await queryAll("SELECT * FROM absensi");
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupPayload = {
@@ -1476,7 +1479,7 @@ apiRouter.get("/admin/backup/export-json", authenticate, requireAdmin, (req: Req
 apiRouter.get("/admin/backup/download-sqlite", authenticate, requireAdmin, (req: Request, res: Response) => {
   saveDb();
   if (!fs.existsSync(dbFilePath)) {
-    res.status(404).json({ error: "File database SQLite tidak ditemukan." });
+    res.status(404).json({ error: "File database SQLite lokal tidak ditemukan atau aplikasi sedang menggunakan database cloud." });
     return;
   }
   const timestamp = new Date().toISOString().slice(0, 10);
@@ -1484,7 +1487,7 @@ apiRouter.get("/admin/backup/download-sqlite", authenticate, requireAdmin, (req:
 });
 
 // Restore database from JSON backup
-apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, (req: Request, res: Response) => {
+apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, async (req: Request, res: Response) => {
   const payload = req.body;
   const backupData = payload?.data || payload;
 
@@ -1496,9 +1499,9 @@ apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, (req: R
   try {
     // 1. Restore Pengaturan if provided
     if (Array.isArray(backupData.pengaturan) && backupData.pengaturan.length > 0) {
-      run("DELETE FROM pengaturan;");
+      await run("DELETE FROM pengaturan;");
       for (const p of backupData.pengaturan) {
-        run(
+        await run(
           `INSERT INTO pengaturan (id, nama_pondok, nama_madrasah, latitude_pondok, longitude_pondok, radius_absensi, jam_masuk, batas_terlambat, jam_pulang, hari_aktif, logo_url, gas_url, gas_auto_sync, gas_sheet_name)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
@@ -1523,9 +1526,9 @@ apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, (req: R
 
     // 2. Restore Guru
     if (Array.isArray(backupData.guru) && backupData.guru.length > 0) {
-      run("DELETE FROM guru;");
+      await run("DELETE FROM guru;");
       for (const g of backupData.guru) {
-        run(
+        await run(
           `INSERT INTO guru (id, nama, nip, no_hp, mata_pelajaran, status)
            VALUES (?, ?, ?, ?, ?, ?)`,
           [g.id, g.nama, g.nip || "", g.no_hp || "", g.mata_pelajaran || "", g.status || "Aktif"]
@@ -1535,9 +1538,9 @@ apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, (req: R
 
     // 3. Restore Users
     if (Array.isArray(backupData.users) && backupData.users.length > 0) {
-      run("DELETE FROM users;");
+      await run("DELETE FROM users;");
       for (const u of backupData.users) {
-        run(
+        await run(
           `INSERT INTO users (id, username, password, role, guru_id)
            VALUES (?, ?, ?, ?, ?)`,
           [u.id, u.username, u.password, u.role, u.guru_id || null]
@@ -1547,9 +1550,9 @@ apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, (req: R
 
     // 4. Restore Jadwal Pelajaran
     if (Array.isArray(backupData.jadwal_pelajaran)) {
-      run("DELETE FROM jadwal_pelajaran;");
+      await run("DELETE FROM jadwal_pelajaran;");
       for (const j of backupData.jadwal_pelajaran) {
-        run(
+        await run(
           `INSERT INTO jadwal_pelajaran (id, guru_id, mata_pelajaran, kitab, kelas, hari, jam_mulai, jam_selesai, ruangan, keterangan)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [j.id, j.guru_id, j.mata_pelajaran, j.kitab || "", j.kelas, j.hari, j.jam_mulai, j.jam_selesai, j.ruangan || "", j.keterangan || ""]
@@ -1559,9 +1562,9 @@ apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, (req: R
 
     // 5. Restore Absensi
     if (Array.isArray(backupData.absensi)) {
-      run("DELETE FROM absensi;");
+      await run("DELETE FROM absensi;");
       for (const a of backupData.absensi) {
-        run(
+        await run(
           `INSERT INTO absensi (id, guru_id, tanggal, hari, jam_masuk, status, latitude_masuk, longitude_masuk, lokasi_masuk, keterangan_masuk, jam_pulang, latitude_pulang, longitude_pulang, lokasi_pulang, keterangan_pulang, keterangan, sync_status, synced_at, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
@@ -1607,4 +1610,3 @@ apiRouter.post("/admin/backup/restore-json", authenticate, requireAdmin, (req: R
     res.status(500).json({ error: `Gagal memulihkan cadangan: ${err.message || String(err)}` });
   }
 });
-

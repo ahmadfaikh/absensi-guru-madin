@@ -29,6 +29,8 @@ interface BackupStats {
   absensiCount: number;
   sqliteSize: number;
   databaseFile: string;
+  isTurso?: boolean;
+  databaseType?: string;
   lastBackupRecommendation: string;
 }
 
@@ -206,14 +208,27 @@ export const AdminBackupView: React.FC = () => {
               <Database className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+              <h2 className="text-lg font-bold text-slate-800 flex flex-wrap items-center gap-2">
                 <span>Cadangan & Pemulihan Data</span>
                 <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-indigo-100 text-indigo-700">
                   Backup & Restore
                 </span>
+                {stats?.isTurso ? (
+                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 flex items-center gap-1 border border-emerald-200">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-pulse"></span>
+                    Turso Cloud Aktif (Permanen)
+                  </span>
+                ) : (
+                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 flex items-center gap-1 border border-amber-200">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-600"></span>
+                    SQLite Lokal
+                  </span>
+                )}
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Amankan seluruh data kehadiran guru, akun, jadwal, dan identitas madrasah sebelum update webapp
+                {stats?.isTurso 
+                  ? "Database terhubung ke Turso Cloud SQLite. Data aman dan tidak akan hilang saat redeploy/cold-start Vercel."
+                  : "Database menggunakan file SQLite lokal. Untuk penyimpanan permanen di Vercel, konfigurasikan Turso Cloud."}
               </p>
             </div>
           </div>

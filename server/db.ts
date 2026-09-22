@@ -1,11 +1,14 @@
 import type { Database } from "sql.js";
 // @ts-ignore
 import initSqlJs from "sql.js/dist/sql-asm.js";
+import { createClient, Client } from "@libsql/client";
 import fs from "fs";
 import path from "path";
 import bcrypt from "bcryptjs";
 
-let db: Database;
+let sqlJsDb: Database | null = null;
+let tursoClient: Client | null = null;
+
 const dataDir = process.env.VERCEL ? path.join("/tmp", "data") : path.join(process.cwd(), "data");
 const dbFile = path.join(dataDir, "absensi.sqlite");
 export const dbFilePath = dbFile;
@@ -27,28 +30,44 @@ export interface SettingRecord {
   gas_sheet_name?: string;
 }
 
+export function isUsingTurso(): boolean {
+  return !!(process.env.TURSO_DATABASE_URL && process.env.TURSO_DATABASE_URL.trim().length > 0);
+}
+
 export async function initDatabase() {
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-
-  const SQL = await initSqlJs();
-
-  if (fs.existsSync(dbFile)) {
-    try {
-      const fileBuffer = fs.readFileSync(dbFile);
-      db = new SQL.Database(fileBuffer);
-    } catch (e) {
-      console.error("Failed to load existing db file, creating fresh DB:", e);
-      db = new SQL.Database();
-    }
+  if (isUsingTurso()) {
+    console.log("Connecting to Turso Cloud SQLite database...");
+    const url = process.env.TURSO_DATABASE_URL!.trim();
+    const authToken = process.env.TURSO_AUTH_TOKEN ? process.env.TURSO_AUTH_TOKEN.trim() : undefined;
+    tursoClient = createClient({
+      url,
+      authToken,
+    });
+    console.log("Turso Cloud Client initialized successfully.");
   } else {
-    db = new SQL.Database();
+    console.log("Initializing local SQLite database (sql.js)...");
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    const SQL = await initSqlJs();
+
+    if (fs.existsSync(dbFile)) {
+      try {
+        const fileBuffer = fs.readFileSync(dbFile);
+        sqlJsDb = new SQL.Database(fileBuffer);
+      } catch (e) {
+        console.error("Failed to load existing db file, creating fresh DB:", e);
+        sqlJsDb = new SQL.Database();
+      }
+    } else {
+      sqlJsDb = new SQL.Database();
+    }
   }
 
-  // Create tables according to requirement #18
-  db.run(`
-    CREATE TABLE IF NOT EXISTS pengaturan (
+  // Create tables according to schema
+  const schemaStatements = [
+    `CREATE TABLE IF NOT EXISTS pengaturan (
       id INTEGER PRIMARY KEY,
       nama_pondok TEXT NOT NULL,
       nama_madrasah TEXT NOT NULL,
@@ -59,28 +78,31 @@ export async function initDatabase() {
       batas_terlambat TEXT NOT NULL,
       jam_pulang TEXT NOT NULL,
       hari_aktif TEXT,
-      logo_url TEXT
-    );
+      logo_url TEXT,
+      gas_url TEXT,
+      gas_auto_sync INTEGER DEFAULT 1,
+      gas_sheet_name TEXT DEFAULT 'Absensi_Guru'
+    );`,
 
-    CREATE TABLE IF NOT EXISTS guru (
+    `CREATE TABLE IF NOT EXISTS guru (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       nama TEXT NOT NULL,
       nip TEXT,
       no_hp TEXT,
       mata_pelajaran TEXT,
       status TEXT DEFAULT 'Aktif'
-    );
+    );`,
 
-    CREATE TABLE IF NOT EXISTS users (
+    `CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
       password TEXT NOT NULL,
       role TEXT NOT NULL,
       guru_id INTEGER,
       FOREIGN KEY (guru_id) REFERENCES guru(id) ON DELETE CASCADE
-    );
+    );`,
 
-    CREATE TABLE IF NOT EXISTS absensi (
+    `CREATE TABLE IF NOT EXISTS absensi (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guru_id INTEGER NOT NULL,
       tanggal TEXT NOT NULL,
@@ -97,12 +119,14 @@ export async function initDatabase() {
       lokasi_pulang TEXT,
       keterangan_pulang TEXT,
       keterangan TEXT,
+      sync_status TEXT DEFAULT 'pending',
+      synced_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY (guru_id) REFERENCES guru(id) ON DELETE CASCADE
-    );
+    );`,
 
-    CREATE TABLE IF NOT EXISTS jadwal_pelajaran (
+    `CREATE TABLE IF NOT EXISTS jadwal_pelajaran (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       guru_id INTEGER NOT NULL,
       mata_pelajaran TEXT NOT NULL,
@@ -114,34 +138,38 @@ export async function initDatabase() {
       ruangan TEXT,
       keterangan TEXT,
       FOREIGN KEY (guru_id) REFERENCES guru(id) ON DELETE CASCADE
-    );
-  `);
+    );`,
+  ];
+
+  for (const stmt of schemaStatements) {
+    await execRaw(stmt);
+  }
 
   // Ensure Google Apps Script columns exist in case of pre-existing database
-  try { db.run("ALTER TABLE pengaturan ADD COLUMN gas_url TEXT;"); } catch {}
-  try { db.run("ALTER TABLE pengaturan ADD COLUMN gas_auto_sync INTEGER DEFAULT 1;"); } catch {}
-  try { db.run("ALTER TABLE pengaturan ADD COLUMN gas_sheet_name TEXT DEFAULT 'Absensi_Guru';"); } catch {}
-  try { db.run("ALTER TABLE absensi ADD COLUMN sync_status TEXT DEFAULT 'pending';"); } catch {}
-  try { db.run("ALTER TABLE absensi ADD COLUMN synced_at TEXT;"); } catch {}
+  try { await execRaw("ALTER TABLE pengaturan ADD COLUMN gas_url TEXT;"); } catch {}
+  try { await execRaw("ALTER TABLE pengaturan ADD COLUMN gas_auto_sync INTEGER DEFAULT 1;"); } catch {}
+  try { await execRaw("ALTER TABLE pengaturan ADD COLUMN gas_sheet_name TEXT DEFAULT 'Absensi_Guru';"); } catch {}
+  try { await execRaw("ALTER TABLE absensi ADD COLUMN sync_status TEXT DEFAULT 'pending';"); } catch {}
+  try { await execRaw("ALTER TABLE absensi ADD COLUMN synced_at TEXT;"); } catch {}
 
   // Seed default settings if empty
-  const settingsCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM pengaturan");
+  const settingsCount = await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM pengaturan");
   if (!settingsCount || settingsCount.count === 0) {
-    db.run(
+    await run(
       `INSERT INTO pengaturan (id, nama_pondok, nama_madrasah, latitude_pondok, longitude_pondok, radius_absensi, jam_masuk, batas_terlambat, jam_pulang, hari_aktif, logo_url)
        VALUES (1, 'Pondok Pesantren Al Is''af', 'Madrasah Diniyah Miftahul Huda', -7.02558, 113.86542, 100, '20:00', '20:05', '21:30', 'Sabtu,Ahad,Senin,Selasa,Rabu,Kamis', '')`
     );
   }
 
   // Seed default admin if empty
-  const adminUser = queryOne<{ id: number }>("SELECT id FROM users WHERE username = 'admin'");
+  const adminUser = await queryOne<{ id: number }>("SELECT id FROM users WHERE username = 'admin'");
   if (!adminUser) {
     const adminPassHash = bcrypt.hashSync("admin123", 10);
-    db.run(`INSERT INTO users (username, password, role, guru_id) VALUES ('admin', '${adminPassHash}', 'Administrator', NULL)`);
+    await run(`INSERT INTO users (username, password, role, guru_id) VALUES ('admin', '${adminPassHash}', 'Administrator', NULL)`);
   }
 
   // Seed default teachers and accounts if none exist
-  const guruCount = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM guru");
+  const guruCount = await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM guru");
   if (!guruCount || guruCount.count === 0) {
     const defaultGuruList = [
       {
@@ -191,13 +219,13 @@ export async function initDatabase() {
     const passHash = bcrypt.hashSync("guru123", 10);
 
     for (const g of defaultGuruList) {
-      db.run(
+      await run(
         `INSERT INTO guru (nama, nip, no_hp, mata_pelajaran, status) VALUES (?, ?, ?, ?, 'Aktif')`,
         [g.nama, g.nip, g.no_hp, g.mapel]
       );
-      const inserted = queryOne<{ id: number }>("SELECT last_insert_rowid() as id");
+      const inserted = await queryOne<{ id: number }>("SELECT last_insert_rowid() as id");
       if (inserted) {
-        db.run(
+        await run(
           `INSERT INTO users (username, password, role, guru_id) VALUES (?, ?, 'Guru', ?)`,
           [g.username, passHash, inserted.id]
         );
@@ -205,21 +233,29 @@ export async function initDatabase() {
     }
 
     // Seed realistic attendance records for past 7 days so reports, statistics, charts are populated
-    seedInitialAttendance();
+    await seedInitialAttendance();
   }
 
   // Seed teaching schedules if empty
-  seedJadwalPelajaran();
+  await seedJadwalPelajaran();
 
   saveDb();
-  console.log("Database initialized successfully with relational schema.");
+  console.log(`Database initialized successfully (${isUsingTurso() ? "Turso Cloud" : "Local SQLite"}).`);
 }
 
-function seedJadwalPelajaran() {
-  const count = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM jadwal_pelajaran");
+async function execRaw(sql: string) {
+  if (tursoClient) {
+    await tursoClient.execute(sql);
+  } else if (sqlJsDb) {
+    sqlJsDb.run(sql);
+  }
+}
+
+async function seedJadwalPelajaran() {
+  const count = await queryOne<{ count: number }>("SELECT COUNT(*) as count FROM jadwal_pelajaran");
   if (count && count.count > 0) return;
 
-  const teachers = queryAll<{ id: number; nama: string; mata_pelajaran: string }>(
+  const teachers = await queryAll<{ id: number; nama: string; mata_pelajaran: string }>(
     "SELECT id, nama, mata_pelajaran FROM guru ORDER BY id ASC"
   );
   if (teachers.length === 0) return;
@@ -262,7 +298,7 @@ function seedJadwalPelajaran() {
   for (const s of sampleSchedules) {
     if (teachers[s.guruIdx]) {
       const guru = teachers[s.guruIdx];
-      db.run(
+      await run(
         `INSERT INTO jadwal_pelajaran (guru_id, mata_pelajaran, kitab, kelas, hari, jam_mulai, jam_selesai, ruangan, keterangan)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [guru.id, s.mapel, s.kitab, s.kelas, s.hari, s.mulai, s.selesai, s.ruangan, s.ket]
@@ -271,8 +307,8 @@ function seedJadwalPelajaran() {
   }
 }
 
-function seedInitialAttendance() {
-  const teachers = queryAll<{ id: number; nama: string }>("SELECT id, nama FROM guru");
+async function seedInitialAttendance() {
+  const teachers = await queryAll<{ id: number; nama: string }>("SELECT id, nama FROM guru");
   if (teachers.length === 0) return;
 
   const dayNames = ["Ahad", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
@@ -287,8 +323,8 @@ function seedInitialAttendance() {
 
     if (dayName === "Jumat") continue; // Day off in pesantren
 
-    teachers.forEach((teacher, idx) => {
-      // Vary attendance: most on time, some late, rare izin
+    for (let idx = 0; idx < teachers.length; idx++) {
+      const teacher = teachers[idx];
       let status = "MASUK";
       let jamMasuk = "19:55:20";
       let jamPulang = "21:32:10";
@@ -316,7 +352,7 @@ function seedInitialAttendance() {
         lng = 0;
       }
 
-      db.run(
+      await run(
         `INSERT INTO absensi (
           guru_id, tanggal, hari, jam_masuk, status,
           latitude_masuk, longitude_masuk, lokasi_masuk, keterangan_masuk,
@@ -343,14 +379,18 @@ function seedInitialAttendance() {
           `${dateStr} ${jamPulang || "21:30:00"}`,
         ]
       );
-    });
+    }
   }
 }
 
 export function saveDb() {
-  if (!db) return;
+  if (isUsingTurso()) {
+    // Turso executes and persists mutations directly to cloud. No local disk save needed.
+    return;
+  }
+  if (!sqlJsDb) return;
   try {
-    const data = db.export();
+    const data = sqlJsDb.export();
     const buffer = Buffer.from(data);
     fs.writeFileSync(dbFile, buffer);
   } catch (err) {
@@ -358,47 +398,61 @@ export function saveDb() {
   }
 }
 
-export function queryAll<T = any>(sql: string, params: any[] = []): T[] {
-  if (!db) return [];
+export async function queryAll<T = any>(sql: string, params: any[] = []): Promise<T[]> {
   try {
-    const stmt = db.prepare(sql);
-    if (params.length > 0) {
-      stmt.bind(params);
+    if (tursoClient) {
+      const rs = await tursoClient.execute({ sql, args: params });
+      return rs.rows as unknown as T[];
+    } else if (sqlJsDb) {
+      const stmt = sqlJsDb.prepare(sql);
+      if (params.length > 0) {
+        stmt.bind(params);
+      }
+      const results: T[] = [];
+      while (stmt.step()) {
+        results.push(stmt.getAsObject() as unknown as T);
+      }
+      stmt.free();
+      return results;
     }
-    const results: T[] = [];
-    while (stmt.step()) {
-      results.push(stmt.getAsObject() as unknown as T);
-    }
-    stmt.free();
-    return results;
+    return [];
   } catch (err) {
     console.error("SQL Error in queryAll:", sql, params, err);
     return [];
   }
 }
 
-export function queryOne<T = any>(sql: string, params: any[] = []): T | null {
-  const rows = queryAll<T>(sql, params);
+export async function queryOne<T = any>(sql: string, params: any[] = []): Promise<T | null> {
+  const rows = await queryAll<T>(sql, params);
   return rows.length > 0 ? rows[0] : null;
 }
 
-export function run(sql: string, params: any[] = []): { lastInsertRowid: number; changes: number } {
-  if (!db) return { lastInsertRowid: 0, changes: 0 };
+export async function run(sql: string, params: any[] = []): Promise<{ lastInsertRowid: number; changes: number }> {
   try {
-    db.run(sql, params);
-    saveDb();
-    const row = queryOne<{ id: number }>("SELECT last_insert_rowid() as id");
-    const changesRow = queryOne<{ count: number }>("SELECT changes() as count");
-    return {
-      lastInsertRowid: row ? row.id : 0,
-      changes: changesRow ? changesRow.count : 1,
-    };
+    if (tursoClient) {
+      const rs = await tursoClient.execute({ sql, args: params });
+      const lastInsertId = rs.lastInsertRowid !== undefined ? Number(rs.lastInsertRowid) : 0;
+      return {
+        lastInsertRowid: lastInsertId,
+        changes: rs.rowsAffected || 1,
+      };
+    } else if (sqlJsDb) {
+      sqlJsDb.run(sql, params);
+      saveDb();
+      const row = await queryOne<{ id: number }>("SELECT last_insert_rowid() as id");
+      const changesRow = await queryOne<{ count: number }>("SELECT changes() as count");
+      return {
+        lastInsertRowid: row ? row.id : 0,
+        changes: changesRow ? changesRow.count : 1,
+      };
+    }
+    return { lastInsertRowid: 0, changes: 0 };
   } catch (err) {
     console.error("SQL Error in run:", sql, params, err);
     throw err;
   }
 }
 
-export function getDatabase(): Database {
-  return db;
+export function getDatabase(): Database | null {
+  return sqlJsDb;
 }

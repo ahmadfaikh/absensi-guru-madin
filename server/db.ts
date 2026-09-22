@@ -4,7 +4,7 @@ import path from "path";
 import bcrypt from "bcryptjs";
 
 let db: Database;
-const dataDir = path.join(process.cwd(), "data");
+const dataDir = process.env.VERCEL ? path.join("/tmp", "data") : path.join(process.cwd(), "data");
 const dbFile = path.join(dataDir, "absensi.sqlite");
 export const dbFilePath = dbFile;
 

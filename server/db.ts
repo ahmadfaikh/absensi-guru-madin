@@ -1,4 +1,6 @@
-import initSqlJs, { Database } from "sql.js";
+import type { Database } from "sql.js";
+// @ts-ignore
+import initSqlJs from "sql.js/dist/sql-asm.js";
 import fs from "fs";
 import path from "path";
 import bcrypt from "bcryptjs";
